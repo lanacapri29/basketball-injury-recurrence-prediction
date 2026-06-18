@@ -1,0 +1,192 @@
+---
+title: "Basketball Injury Recurrence Prediction Project"
+author: "Lana Robison & other group members"
+format: pdf
+editor: visual
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      message = FALSE,
+                      warning = FALSE)
+```
+
+```{r}
+library(tidymodels)
+library(tidyverse)
+
+injury_dat = read_csv("basketball_injury_biomechanical_dataset.csv")
+head(injury_dat)
+
+```
+
+# Cleaning
+
+```{r}
+
+# Convert categorical predictors to numeric 
+dat = injury_dat |> mutate(
+  Position = as.numeric(factor(Position)),
+  Injury_Type = as.numeric(factor(Injury_Type)),
+  Injury_Severity = as.numeric(factor(Injury_Severity)),
+  Rehabilitation_Program = as.numeric(factor(Rehabilitation_Program)),
+  Injury_Recurrence = factor(Injury_Recurrence)
+) |>
+  select(
+    -c(Player_ID, Date_of_Injury)
+  )
+
+# Visualization of Injury Recurrences
+dat |> ggplot(aes(x = Injury_Recurrence)) + 
+  geom_bar() + 
+  theme_minimal() + 
+  scale_x_discrete()
+
+set.seed(23)
+dat_split = initial_split(dat, prop = 0.8)
+dat_train = training(dat_split)
+dat_test = testing(dat_split)
+
+```
+
+# Random Forests Classification
+
+```{r}
+
+# Define random forest model 
+ref_spec = rand_forest(mtry = tune(), min_n = tune(),
+                       trees = 100) |>
+  set_mode("classification") |>
+  set_engine("ranger")
+
+tunning_grid = grid_regular(
+  mtry(range = c(5,14)),
+  min_n(range = c(2, 40)),
+  levels = 5
+)
+
+dat_folds = vfold_cv(dat_train, v = 3, strata = Injury_Recurrence)
+
+# Tune the model using CV
+rf_results = tune_grid(
+  ref_spec,
+  Injury_Recurrence~.,
+  resamples = dat_folds,
+  grid = tunning_grid,
+  metrics = metric_set(accuracy)
+)
+
+# Select the best hyperparameters based on accuracy
+best_parms = select_best(rf_results, metric = "accuracy")
+
+# Fit final RF model
+ref_spec = rand_forest(mtry = best_parms$mtry, min_n = best_parms$min_n,
+                       trees = 100) |>
+  set_mode("classification") |>
+  set_engine("ranger")
+
+ref_fit = ref_spec |>
+  fit(Injury_Recurrence~., data = dat_train)
+
+# Evaluate model on train data 
+probs_train = ref_fit |> predict(dat_train, type = "class") |>
+  bind_cols(dat_train)
+
+print(accuracy(probs_train, truth = Injury_Recurrence, 
+               estimate = .pred_class))
+
+# Evaluate model on test data
+probs_test = ref_fit |> predict(dat_test, type = "class") |>
+  bind_cols(dat_test)
+
+print(accuracy(probs_test, truth = Injury_Recurrence, 
+               estimate = .pred_class))
+
+```
+
+We chose a random forests model because it is able to handle both numerical and categorical predictors, and because it generally performs well on datasets with non-linear relationships and high dimensionality. We also felt that for this project we wanted to have a high predictive accuracy, which a random forests model is more prone to provide compared to a logistic regression model.
+
+##### Model Accuracy Results
+
+```{r, echo=FALSE}
+library(knitr)
+
+accuracy_table <- data.frame(
+  Dataset = c("Train", "Test"),
+  Accuracy = c(0.81, 0.65)
+)
+
+kable(accuracy_table)
+
+```
+
+Our model is overfitting the data, it performs exceptionally well on the training data, but poorly on the test data. This means it has memorized training patterns that do not generalize well.
+
+```{r}
+
+library(vip)
+
+# refit with importance enabled for variable ranking
+ref_spec = rand_forest(mtry = best_parms$mtry, 
+                       min_n = best_parms$min_n,
+                       trees = 100) |>
+  set_mode("classification") |>
+  set_engine("ranger", importance = "impurity")
+
+ref_fit = ref_spec |>
+  fit(Injury_Recurrence~., data = dat_train)
+
+# Visualize variable importance
+vip(ref_fit$fit, num_features = 20)
+
+```
+
+According to the above variable importance plot, the most important predictors for injury recurrence were "knee_angle_deg" (player's knee angle in degrees during basketball movements), "jump_height_cm" (height the player jumped, measured in centimeters), and "Rehabilitation_Efficiency_Score" (a score indicating how efficient the rehabilitation was). These variables being important align with our expectations of the data, as inefficient recovery and movement/ balance abnormalities often contribute to injury. What was surprising however was that "Injury_Type" and "Injury_Severity" were not more important variables as some types of injuries are more likely to reoccur and and more severe injury's tend to not heal completely compared to less severe injury, making a player more prone to re-injure themselves.
+
+# Principal Component Analysis
+
+```{r}
+
+# PCA recipe for predictors only (unsupervised)
+dat_rec = recipe(~., data = injury_dat) |>
+  step_naomit(all_predictors()) |> 
+  step_rm(Player_ID, Injury_Recurrence, Date_of_Injury) |> # removed 
+  #because not important
+  step_normalize(all_numeric_predictors()) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_pca(all_predictors(), threshold = .95) |> # step 5 
+  prep()
+
+
+# Apply PCA
+pca_rec = dat_rec |> bake(new_data = NULL)
+
+pca_rec
+
+
+# Variance explained by components
+dat_rec |> tidy(number = 5, type = "variance") |> 
+  filter(terms == "cumulative percent variance") |> 
+  print(n = 20)
+
+
+
+pca_rec |> ggplot(aes(x = PC08, y = PC09)) + 
+  geom_point()
+
+
+
+
+```
+
+Through principal component analysis we could reduce the original predictor set to $15$ components while retaining $95.05\%$ of the variance. However the cumulative variance seems to level off at about $11$ components which would retain about $86.45\%$ of the variance. Since our data does not have high dimensionality, principal component analysis doesn't need to be applied. If we were looking to reduce dimensionality for a simpler or faster model like logistic regression we could use these PC's as inputs.
+
+# Potential Next Steps
+
+##### Address Overfitting
+
+To try and improve our model we could try to simplify it by reducing the trees and increasing min_n and we could try dimensionalty reduction with PCA before modeling.
+
+##### Evaluate Other Metrics
+
+Instead of basing our model on accuracy, we could check precision and ROC AUC.
